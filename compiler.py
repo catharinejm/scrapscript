@@ -82,7 +82,8 @@ class IsHole(MatchKind):
 
 
 class IsString(MatchKind):
-    pass
+    def compile(self, arg: str) -> str:
+        return f"is_string({arg})"
 
 
 class IsVar(MatchKind):
@@ -110,6 +111,21 @@ def coerce_int(object: Object) -> int:
     return object.value
 
 
+@dataclasses.dataclass
+class StringHasValue(MatchKind):
+    value: str
+
+    def compile(self, arg: str) -> str:
+        if len(self.value) < 8:
+            return f"({arg} == mksmallstring({json.dumps(self.value)}, {len(self.value)}))"
+        return f'string_equal_cstr_len({arg}, "{json.dumps(self.value)}", {len(self.value)})'
+
+
+def coerce_string(object: Object) -> str:
+    assert isinstance(object, String)
+    return object.value
+
+
 @dataclasses.dataclass(frozen=True)
 class CondExpr(Object):
     arg: Var  # Actually, probably this one isn't needed??
@@ -121,52 +137,77 @@ class CondExpr(Object):
 class MatchExpr(Object):
     arg: Object  # Maybe not needed?
     cases: typing.List[CondExpr]
+    fallthrough_case: Where | None
 
 
-def group_cases(cases: typing.List[MatchCase], keyof: object) -> typing.List[typing.List[MatchCase]]:
+def group_cases(
+    cases: typing.List[MatchCase], keyof: object
+) -> tuple[typing.List[typing.List[MatchCase]], MatchCase | None]:
+    print("ungrouped cases")
+    print(cases)
     groups = {}
+    fallthrough = None
     for case in cases:
-        if isinstance(case, Var):
-            if not groups:
-                raise NotImplementedError
-            else:
-                groups[list(groups.keys())[-1]].append(case)
+        if isinstance(case.pattern, Var):
+            fallthrough = case
+            # nothing can match after the var
+            break
         else:
             if keyof(case) in groups:
                 groups[keyof(case)].append(case)
             else:
                 groups[keyof(case)] = [case]
 
-    return list(groups.values())
+    print("grouped cases")
+    print(groups)
+    return list(groups.values()), fallthrough
 
 
 def compile_match_function(match_fn: MatchFunction) -> Function:
     arg = Var("x")
-    cases = compile_ungrouped_match_cases(arg, match_fn.cases, lambda x: type(x.pattern).__name__)
-    return Function(arg, MatchExpr(arg, cases))
+    cases, fallthrough_case = compile_ungrouped_match_cases(arg, match_fn.cases, lambda x: type(x.pattern).__name__)
+    return Function(arg, MatchExpr(arg, cases, fallthrough_case))
 
 
-def compile_ungrouped_match_cases(arg: Var, cases: typing.List[MatchCase], group_key: object) -> typing.List[CondExpr]:
-    grouped = group_cases(cases, group_key)
-    return [expand_group(arg, group) for group in grouped]
+def compile_ungrouped_match_cases(
+    arg: Var, cases: typing.List[MatchCase], group_key: object
+) -> tuple[typing.List[CondExpr], Where | None]:
+    grouped, fallthrough_case = group_cases(cases, group_key)
+    return [expand_group(arg, group, fallthrough_case) for group in grouped], compile_var_case(arg, fallthrough_case)
 
 
-def compile_int_cases(arg: Var, group: typing.List[MatchCase]):
+def compile_var_case(arg: Var, case: MatchCase | None) -> Where | None:
+    if case:
+        assert isinstance(case.pattern, Var)
+        return Where(case.body, Assign(case.pattern, arg))
+    return None
+
+
+def compile_int_cases(arg: Var, group: typing.List[MatchCase], fallthrough_case: MatchCase | None):
     cases = [CondExpr(arg, NumberHasValue(coerce_int(case.pattern)), case.body) for case in group]
-    return MatchExpr(arg, cases)
+    return MatchExpr(arg, cases, compile_var_case(arg, fallthrough_case))
 
 
-def expand_group(arg: Var, group: typing.List[MatchCase]):
+def compile_string_cases(arg: Var, group: typing.List[MatchCase], fallthrough_case: MatchCase | None):
+    cases = [CondExpr(arg, StringHasValue(coerce_string(case.pattern)), case.body) for case in group]
+    return MatchExpr(arg, cases, compile_var_case(arg, fallthrough_case))
+
+
+def expand_group(arg: Var, group: typing.List[MatchCase], fallthrough_case: MatchCase | None):
+    if not group:
+        assert fallthrough_case
+        return compile_var_case(arg, fallthrough_case)
     canonical_case = group[0]
     if isinstance(canonical_case.pattern, Int):
-        return CondExpr(arg, IsNumber(), compile_int_cases(arg, group))
+        return CondExpr(arg, IsNumber(), compile_int_cases(arg, group, fallthrough_case))
     if isinstance(canonical_case.pattern, Hole):
         # throwing away subsequent holes
         return CondExpr(arg, IsHole(), canonical_case.body)
     if isinstance(canonical_case.pattern, Var):
-        return CondExpr(arg, AcceptAny(), Where(canonical_case.body, Assign(canonical_case.pattern, arg)))
+        raise Exception("saw a var")
     # if isinstance(canonical_case.pattern, Variant):
-    # if isinstance(canonical_case.pattern, String):
+    if isinstance(canonical_case.pattern, String):
+        return CondExpr(arg, IsString(), compile_string_cases(arg, group, fallthrough_case))
     # if isinstance(canonical_case.pattern, Var):
     # if isinstance(canonical_case.pattern, List):
     # if isinstance(canonical_case.pattern, Record):
@@ -541,7 +582,7 @@ class Compiler:
             return self.compile_function(env, compile_match_function(exp), name=None)
         if isinstance(exp, MatchExpr):
             return self.compile_match_expr(env, exp)
-        raise NotImplementedError(f"exp {type(exp)} {exp}")
+        raise NotImplementedError(f"exp {type(exp)} {exp!r}")
 
     def compile_match_expr(self, env: Env, match_expr: MatchExpr) -> str:
         arg = self.compile(env, match_expr.arg)
@@ -556,8 +597,13 @@ class Compiler:
             self._emit(f"{result} = {case_result};")
             self._emit(f"goto {done};")
             self._emit(f"{fallthrough}:;")
-        self._emit(r'fprintf(stderr, "no matching cases\n");')
-        self._emit("abort();")
+        if match_expr.fallthrough_case:
+            c_name = self.compile(env, match_expr.fallthrough_case)
+            self._emit(f"{result} = {c_name};")
+            self._emit(f"goto {done};")
+        else:
+            self._emit(r'fprintf(stderr, "no matching cases\n");')
+            self._emit("abort();")
         self._emit(f"{done}:;")
         return result
 
