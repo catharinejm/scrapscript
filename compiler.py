@@ -61,11 +61,6 @@ class CompiledFunction:
         return f"struct object* {self.name}({args})"
 
 
-def group_cases(cases: typing.List[MatchCase], key: object) -> typing.List[typing.List[MatchCase]]:
-    sorted_by_key = sorted(cases, key=key)
-    return [list(group) for _, group in itertools.groupby(sorted_by_key, key)]
-
-
 class MatchKind:
     def compile(self, arg: str) -> str:
         raise NotImplementedError
@@ -123,14 +118,24 @@ class MatchExpr(Object):
     cases: typing.List[CondExpr]
 
 
+def group_cases(cases: typing.List[MatchCase], keyof: object) -> typing.List[typing.List[MatchCase]]:
+    groups = {}
+    for case in cases:
+        if keyof(case) in groups:
+            groups[keyof(case)].append(case)
+        else:
+            groups[keyof(case)] = [case]
+
+    return list(groups.values())
+
+
 def compile_match_function(match_fn: MatchFunction) -> Function:
     arg = Var("x")
-    cases = compile_ungrouped_match_cases(arg, match_fn.cases, lambda x: type(x).__name__)
+    cases = compile_ungrouped_match_cases(arg, match_fn.cases, lambda x: type(x.pattern).__name__)
     return Function(arg, MatchExpr(arg, cases))
 
 
 def compile_ungrouped_match_cases(arg: Var, cases: typing.List[MatchCase], group_key: object) -> typing.List[CondExpr]:
-    cases = [case for case in cases]
     grouped = group_cases(cases, group_key)
     return [expand_group(arg, group) for group in grouped]
 
@@ -144,7 +149,9 @@ def expand_group(arg: Var, group: typing.List[MatchCase]):
     canonical_case = group[0]
     if isinstance(canonical_case.pattern, Int):
         return CondExpr(arg, IsNumber(), compile_int_cases(arg, group))
-    # if isinstance(canonical_case.pattern, Hole):
+    if isinstance(canonical_case.pattern, Hole):
+        # throwing away subsequent holes
+        return CondExpr(arg, IsHole(), canonical_case.body)
     # if isinstance(canonical_case.pattern, Variant):
     # if isinstance(canonical_case.pattern, String):
     # if isinstance(canonical_case.pattern, Var):
@@ -548,13 +555,21 @@ class Compiler:
 
     def compile_match_expr(self, env: Env, match_expr: MatchExpr) -> str:
         arg = self.compile(env, match_expr.arg)
+        result = self.gensym("result")
+        done = self.gensym("done")
+        self._emit(f"struct object* {result} = NULL;")
         for cond in match_expr.cases:
             fallthrough = self.gensym("case")
             c_cond = cond.condition.compile(arg)
             self._emit(f"if (!{c_cond}) goto {fallthrough};")
             case_result = self.compile(env, cond.body)
-            self._emit(f"return {case_result};")
+            self._emit(f"{result} = {case_result};")
+            self._emit(f"goto {done};")
             self._emit(f"{fallthrough}:;")
+        self._emit(r'fprintf(stderr, "no matching cases\n");')
+        self._emit("abort();")
+        self._emit(f"{done}:;")
+        return result
 
 
 def compile_to_string(program: Object, debug: bool) -> str:
