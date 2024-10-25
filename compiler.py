@@ -66,6 +66,11 @@ class MatchKind:
         raise NotImplementedError
 
 
+class AcceptAny(MatchKind):
+    def compile(self, arg: str) -> str:
+        return "true"
+
+
 class IsNumber(MatchKind):
     def compile(self, arg: str) -> str:
         return f"is_num({arg})"
@@ -121,10 +126,16 @@ class MatchExpr(Object):
 def group_cases(cases: typing.List[MatchCase], keyof: object) -> typing.List[typing.List[MatchCase]]:
     groups = {}
     for case in cases:
-        if keyof(case) in groups:
-            groups[keyof(case)].append(case)
+        if isinstance(case, Var):
+            if not groups:
+                raise NotImplementedError
+            else:
+                groups[list(groups.keys())[-1]].append(case)
         else:
-            groups[keyof(case)] = [case]
+            if keyof(case) in groups:
+                groups[keyof(case)].append(case)
+            else:
+                groups[keyof(case)] = [case]
 
     return list(groups.values())
 
@@ -152,6 +163,8 @@ def expand_group(arg: Var, group: typing.List[MatchCase]):
     if isinstance(canonical_case.pattern, Hole):
         # throwing away subsequent holes
         return CondExpr(arg, IsHole(), canonical_case.body)
+    if isinstance(canonical_case.pattern, Var):
+        return CondExpr(arg, AcceptAny(), Where(canonical_case.body, Assign(canonical_case.pattern, arg)))
     # if isinstance(canonical_case.pattern, Variant):
     # if isinstance(canonical_case.pattern, String):
     # if isinstance(canonical_case.pattern, Var):
@@ -252,7 +265,7 @@ class Compiler:
             return {**env, name: value}
         if isinstance(exp.value, MatchFunction):
             # Named match function
-            value = self.compile_match_function(env, exp.value, name)
+            value = self.compile_function(env, compile_match_function(exp.value), name)
             return {**env, name: value}
         value = self.compile(env, exp.value)
         return {**env, name: value}
@@ -361,29 +374,6 @@ class Compiler:
                 self._emit(f"if (record_num_fields({arg}) != {len(pattern.data)}) {{ goto {fallthrough}; }}")
             return updates
         raise NotImplementedError("try_match", pattern)
-
-    def compile_match_function(self, env: Env, exp: MatchFunction, name: Optional[str]) -> str:
-        arg = self.gensym()
-        fn = self.make_compiled_function(arg, exp, name)
-        self.functions.append(fn)
-        cur = self.function
-        self.function = fn
-        funcenv = self.compile_function_env(fn, name)
-        for i, case in enumerate(exp.cases):
-            fallthrough = f"case_{i+1}" if i < len(exp.cases) - 1 else "no_match"
-            env_updates = self.try_match(funcenv, arg, case.pattern, fallthrough)
-            case_result = self.compile({**funcenv, **env_updates}, case.body)
-            self._emit(f"return {case_result};")
-            self._emit(f"{fallthrough}:;")
-        self._emit(r'fprintf(stderr, "no matching cases\n");')
-        self._emit("abort();")
-        # Pacify the C compiler
-        self._emit("return NULL;")
-        self.function = cur
-        if not fn.fields:
-            # TODO(max): Closure over freevars but only consts
-            return self._const_closure(fn)
-        return self.make_closure(env, fn)
 
     def make_closure(self, env: Env, fn: CompiledFunction) -> str:
         name = self._mktemp(f"mkclosure(heap, {fn.name}, {len(fn.fields)})")
