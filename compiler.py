@@ -18,6 +18,7 @@ from scrapscript import (
     Hole,
     Int,
     List,
+    MatchCase,
     MatchFunction,
     Object,
     Record,
@@ -58,6 +59,82 @@ class CompiledFunction:
     def decl(self) -> str:
         args = ", ".join(f"struct object* {arg}" for arg in self.params)
         return f"struct object* {self.name}({args})"
+
+
+def group_cases(cases: typing.List[MatchCase], key: object) -> typing.List[typing.List[MatchCase]]:
+    sorted_by_key = sorted(cases, key)
+    return [group for _, group in groupby(sorted_by_key, key)]
+
+
+class MatchKind:
+    pass
+
+
+class IsNumber(MatchKind):
+    pass
+
+
+class IsHole(MatchKind):
+    pass
+
+
+class IsString(MatchKind):
+    pass
+
+
+class IsVar(MatchKind):
+    pass
+
+
+class IsList(MatchKind):
+    pass
+
+
+class IsRecord(MatchKind):
+    pass
+
+
+class NumberHasValue(MatchKind):
+    value: int
+
+
+@dataclasses.dataclass(frozen=True)
+class CondExpr(Object):
+    arg: Var
+    condition: MatchKind
+    body: Object
+
+
+@dataclasses.dataclass(frozen=True)
+class MatchExpr(Object):
+    arg: Object  # Maybe not needed?
+    cases: typing.List[CondExpr]
+
+    def compile_match_function(match_fn: MatchFunction) -> Function:
+        arg = Var("x")
+        cases = compile_ungrouped_match_cases(arg, match_fn.cases, type)
+        return Function(arg, MatchExpr(arg, cases))
+
+    def compile_ungrouped_match_cases(arg: Var, cases: typing.List[MatchCase], group_key) -> typing.List[CondExpr]:
+        patterns = [case.pattern for case in cases]
+        grouped = group_cases(patterns, group_key)
+        return [expand_group(group) for group in grouped]
+
+    def compile_int_cases(arg: Var, group: typing.List[MatchCase]):
+        cases = [CondExpr(arg, NumberHasValue(case.pattern), case.body) for case in group]
+        return MatchExpr(arg, cases)
+
+    def expand_group(arg: Var, group: typing.List[MatchCase]):
+        canonical_case = group[0].case
+        if isinstance(canonical_case.pattern, Int):
+            return CondExpr(arg, IsNumber, compile_int_cases(arg, group))
+        # if isinstance(canonical_case.pattern, Hole):
+        # if isinstance(canonical_case.pattern, Variant):
+        # if isinstance(canonical_case.pattern, String):
+        # if isinstance(canonical_case.pattern, Var):
+        # if isinstance(canonical_case.pattern, List):
+        # if isinstance(canonical_case.pattern, Record):
+        raise NotImplementedError("expand_group", canonical_case.pattern)
 
 
 class Compiler:
