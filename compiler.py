@@ -119,7 +119,7 @@ class StringHasValue(MatchKind):
     def compile(self, arg: str) -> str:
         if len(self.value) < 8:
             return f"({arg} == mksmallstring({json.dumps(self.value)}, {len(self.value)}))"
-        return f'string_equal_cstr_len({arg}, "{json.dumps(self.value)}", {len(self.value)})'
+        return f"string_equal_cstr_len({arg}, {json.dumps(self.value)}, {len(self.value)})"
 
 
 def coerce_string(object: Object) -> str:
