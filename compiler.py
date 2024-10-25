@@ -86,8 +86,9 @@ class IsString(MatchKind):
         return f"is_string({arg})"
 
 
-class IsVar(MatchKind):
-    pass
+class IsVariant(MatchKind):
+    def compile(self, arg: str) -> str:
+        return f"is_variant({arg})"
 
 
 class IsList(MatchKind):
@@ -126,6 +127,14 @@ def coerce_string(object: Object) -> str:
     return object.value
 
 
+@dataclasses.dataclass
+class VariantHasTag(MatchKind):
+    tag: str
+
+    def compile(self, arg: str) -> str:
+        return f"(variant_tag({arg}) == Tag_{self.tag})"
+
+
 @dataclasses.dataclass(frozen=True)
 class CondExpr(Object):
     arg: Var  # Actually, probably this one isn't needed??
@@ -140,15 +149,20 @@ class MatchExpr(Object):
     fallthrough_case: Where | None
 
 
+@dataclasses.dataclass(frozen=True)
+class VariantValueExpr(Object):
+    variant: Object
+
+
 def group_cases(
-    cases: typing.List[MatchCase], keyof: object
+    cases: typing.List[MatchCase], keyof: object, is_fallthrough: object
 ) -> tuple[typing.List[typing.List[MatchCase]], MatchCase | None]:
     print("ungrouped cases")
     print(cases)
     groups = {}
     fallthrough = None
     for case in cases:
-        if isinstance(case.pattern, Var):
+        if is_fallthrough(case):
             fallthrough = case
             # nothing can match after the var
             break
@@ -163,16 +177,29 @@ def group_cases(
     return list(groups.values()), fallthrough
 
 
+def typename(case: MatchCase) -> str:
+    return type(case.pattern).__name__
+
+
+def pattern_is_var(case: MatchCase) -> bool:
+    return isinstance(case.pattern, Var)
+
+
+def let(name: Var, value: Object, body: Object) -> Where:
+    return Where(body, Assign(name, value))
+
+
 def compile_match_function(match_fn: MatchFunction) -> Function:
-    arg = Var("x")
-    cases, fallthrough_case = compile_ungrouped_match_cases(arg, match_fn.cases, lambda x: type(x.pattern).__name__)
-    return Function(arg, MatchExpr(arg, cases, fallthrough_case))
+    fn_arg = Var(gensym("fn_arg"))
+    match_arg = Var(gensym("match"))
+    cases, fallthrough_case = compile_ungrouped_match_cases(match_arg, match_fn.cases, typename, pattern_is_var)
+    return Function(fn_arg, let(match_arg, fn_arg, MatchExpr(match_arg, cases, fallthrough_case)))
 
 
 def compile_ungrouped_match_cases(
-    arg: Var, cases: typing.List[MatchCase], group_key: object
+    arg: Var, cases: typing.List[MatchCase], group_key: object, is_fallthrough: object
 ) -> tuple[typing.List[CondExpr], Where | None]:
-    grouped, fallthrough_case = group_cases(cases, group_key)
+    grouped, fallthrough_case = group_cases(cases, group_key, is_fallthrough)
     return [expand_group(arg, group, fallthrough_case) for group in grouped], compile_var_case(arg, fallthrough_case)
 
 
@@ -193,6 +220,26 @@ def compile_string_cases(arg: Var, group: typing.List[MatchCase], fallthrough_ca
     return MatchExpr(arg, cases, compile_var_case(arg, fallthrough_case))
 
 
+def compile_variant_cases(arg: Var, group: typing.List[MatchCase], fallthrough_case: MatchCase | None):
+    def case_tag(case: MatchCase):
+        assert isinstance(case.pattern, Variant)
+        return case.pattern.tag
+
+    grouped_by_variant, _ = group_cases(group, case_tag, lambda x: False)
+    cond_exprs = []
+    for group in grouped_by_variant:
+        lifted_matches = [MatchCase(case.pattern.value, case.body) for case in group]
+        print("lifted_matches", repr(lifted_matches))
+        inner_arg = Var(gensym("variant_match"))
+        expanded_cases, inner_fallthrough_case = compile_ungrouped_match_cases(
+            inner_arg, lifted_matches, typename, pattern_is_var
+        )
+        match_expr = let(inner_arg, VariantValueExpr(arg), MatchExpr(inner_arg, expanded_cases, inner_fallthrough_case))
+        cond_exprs.append(CondExpr(arg, VariantHasTag(group[0].pattern.tag), match_expr))
+
+    return MatchExpr(arg, cond_exprs, compile_var_case(arg, fallthrough_case))
+
+
 def expand_group(arg: Var, group: typing.List[MatchCase], fallthrough_case: MatchCase | None):
     if not group:
         assert fallthrough_case
@@ -205,18 +252,27 @@ def expand_group(arg: Var, group: typing.List[MatchCase], fallthrough_case: Matc
         return CondExpr(arg, IsHole(), canonical_case.body)
     if isinstance(canonical_case.pattern, Var):
         raise Exception("saw a var")
-    # if isinstance(canonical_case.pattern, Variant):
+    if isinstance(canonical_case.pattern, Variant):
+        return CondExpr(arg, IsVariant(), compile_variant_cases(arg, group, fallthrough_case))
     if isinstance(canonical_case.pattern, String):
         return CondExpr(arg, IsString(), compile_string_cases(arg, group, fallthrough_case))
-    # if isinstance(canonical_case.pattern, Var):
     # if isinstance(canonical_case.pattern, List):
     # if isinstance(canonical_case.pattern, Record):
     raise NotImplementedError("expand_group", canonical_case.pattern)
 
 
+gensym_counter = 0
+
+
+def gensym(stem: str = "tmp") -> str:
+    global gensym_counter
+    gensym_counter += 1
+    return f"{stem}_{gensym_counter-1}"
+
+
 class Compiler:
     def __init__(self, main_fn: CompiledFunction) -> None:
-        self.gensym_counter: int = 0
+        # self.gensym_counter: int = 0
         self.functions: typing.List[CompiledFunction] = [main_fn]
         self.function: CompiledFunction = main_fn
         self.record_keys: Dict[str, int] = {}
@@ -259,8 +315,7 @@ class Compiler:
         return result
 
     def gensym(self, stem: str = "tmp") -> str:
-        self.gensym_counter += 1
-        return f"{stem}_{self.gensym_counter-1}"
+        return gensym(stem)
 
     def _emit(self, line: str) -> None:
         self.function.code.append(line)
@@ -582,6 +637,9 @@ class Compiler:
             return self.compile_function(env, compile_match_function(exp), name=None)
         if isinstance(exp, MatchExpr):
             return self.compile_match_expr(env, exp)
+        if isinstance(exp, VariantValueExpr):
+            value = self.compile(env, exp.variant)
+            return self._mktemp(f"variant_value({value});")
         raise NotImplementedError(f"exp {type(exp)} {exp!r}")
 
     def compile_match_expr(self, env: Env, match_expr: MatchExpr) -> str:
@@ -590,6 +648,8 @@ class Compiler:
         done = self.gensym("done")
         self._emit(f"struct object* {result} = NULL;")
         for cond in match_expr.cases:
+            if isinstance(cond.condition, VariantHasTag):
+                self.variant_tag(cond.condition.tag)
             fallthrough = self.gensym("case")
             c_cond = cond.condition.compile(arg)
             self._emit(f"if (!{c_cond}) goto {fallthrough};")
