@@ -92,7 +92,8 @@ class IsVariant(MatchKind):
 
 
 class IsList(MatchKind):
-    pass
+    def compile(self, arg: str) -> str:
+        return f"is_list({arg})"
 
 
 class IsRecord(MatchKind):
@@ -135,6 +136,11 @@ class VariantHasTag(MatchKind):
         return f"(variant_tag({arg}) == Tag_{self.tag})"
 
 
+class ListIsEmpty(MatchKind):
+    def compile(self, arg: str) -> str:
+        return f"is_empty_list({arg})"
+
+
 @dataclasses.dataclass(frozen=True)
 class CondExpr(Object):
     arg: Var  # Actually, probably this one isn't needed??
@@ -146,6 +152,19 @@ class CondExpr(Object):
 class MatchExpr(Object):
     arg: Object  # Maybe not needed?
     cases: typing.List[CondExpr]
+    fallthrough_case: Where | None
+
+
+@dataclasses.dataclass(frozen=True)
+class SingleListMatchExpr(Object):
+    matches: typing.List[MatchExpr]
+
+
+@dataclasses.dataclass(frozen=True)
+class DestructureListMatchExpr(MatchExpr):
+    arg: Object
+    vars: typing.List[Var]
+    match_groups: typing.Map[int, typing.List[SingleListMatchExpr]]
     fallthrough_case: Where | None
 
 
@@ -240,6 +259,48 @@ def compile_variant_cases(arg: Var, group: typing.List[MatchCase], fallthrough_c
     return MatchExpr(arg, cond_exprs, compile_var_case(arg, fallthrough_case))
 
 
+def compile_single_list_match(
+    vars: typing.List[Var], matches: typing.List[MatchCase], fallthrough_case: MatchCase | None
+):
+    pass
+
+
+def compile_list_cases(arg: Var, list_cases: typing.List[MatchCase], fallthrough_case: MatchCase | None):
+    # Sort matches by length asc
+    # if top match is empty and arg is empty, eval match body
+    # try to bind first N elems of list, where N = shortest match length
+    #   if insufficient elems, goto fallthrough_case
+    #   if elems remain, skip to next group
+    #   otherwise, match against each case in group, left to right, until a full match hits, or no matches remain
+    #     if none remain go to fallthrough_case
+    # if no more groups, go to fallthrough_case
+
+    def matchlen(case: MatchCase):
+        assert isinstance(case.pattern, List)
+        return len(case.pattern.items)
+
+    sorted_by_len = sorted(list_cases, key=matchlen)
+    grouped_by_len = itertools.grouped(sorted_by_len, matchlen)
+
+    maxlen = matchlen(grouped_by_len[-1])
+    vars = [Var(gensym(f"listelem_{i}")) for i in range(maxlen)]
+
+    match_groups = {}
+    for l, group in grouped_by_len:
+        if l == 0:
+            single_list_matches = [
+                MatchExpr(arg, [CondExpr(arg, ListIsEmpty(), group[0].body)], compile_var_case(fallthrough_case))
+            ]
+        else:
+            single_list_matches = [
+                compile_single_list_match(vars, match_list, fallthrough_case) for match_list in group
+            ]
+
+        match_groups[l] = single_list_matches
+
+    return DestructureListMatchExpr(arg, vars, match_groups, fallthrough_case)
+
+
 def expand_group(arg: Var, group: typing.List[MatchCase], fallthrough_case: MatchCase | None):
     if not group:
         assert fallthrough_case
@@ -257,6 +318,7 @@ def expand_group(arg: Var, group: typing.List[MatchCase], fallthrough_case: Matc
     if isinstance(canonical_case.pattern, String):
         return CondExpr(arg, IsString(), compile_string_cases(arg, group, fallthrough_case))
     # if isinstance(canonical_case.pattern, List):
+    #     return CondExpr(arg, IsList(), compile_list_cases(arg, group, fallthrough_case))
     # if isinstance(canonical_case.pattern, Record):
     raise NotImplementedError("expand_group", canonical_case.pattern)
 
